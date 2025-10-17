@@ -481,6 +481,30 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether to use the DFT loss."},
     )
+    use_iqa_no_anchor_loss: bool = field(
+        default=False,
+        metadata={"help": "Enable CE + Gaussian KL + Huber losses for IQA (<answer> score) supervision."},
+    )
+    iqa_loss_step: float = field(
+        default=0.05,
+        metadata={"help": "Grid step size for enumerating candidate scores in the IQA loss."},
+    )
+    iqa_loss_sigma: float = field(
+        default=0.15,
+        metadata={"help": "Standard deviation of the Gaussian soft label in the IQA KL term."},
+    )
+    iqa_loss_delta: float = field(
+        default=0.1,
+        metadata={"help": "Delta parameter used by the IQA Huber regularizer."},
+    )
+    iqa_loss_kl_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight applied to the IQA KL divergence term."},
+    )
+    iqa_loss_reg_weight: float = field(
+        default=1.0,
+        metadata={"help": "Weight applied to the IQA expectation regularizer."},
+    )
     freeze_vision_tower: bool = field(
         default=True,
         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},

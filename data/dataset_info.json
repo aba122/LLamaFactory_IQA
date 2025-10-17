@@ -38,6 +38,22 @@
       "assistant_tag": "assistant"
     }
   },
+  "Q-insight_CoT_GPT4_v3_Reflection_SFT": {
+    "file_name": "/mnt/workspace/xwl/dataset/CoT_Dataset/KONIQ/SFT_GPT4_V3_Reflection/train_koniq_7k_GPT4_v3_reflection_sft.json",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "images": "images",
+      "score": "gt_score"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "system_tag": "system"
+    }
+  },
   "mllm_audio_demo": {
     "file_name": "mllm_audio_demo.json",
     "formatting": "sharegpt",

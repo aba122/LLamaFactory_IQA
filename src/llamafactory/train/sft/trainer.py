@@ -88,6 +88,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
             self.compute_loss_func = dft_loss_func
 
+        self._iqa_score_loss = None
+
         # Verify FP8 status after trainer initialization (accelerator should be available)
         if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
             verify_fp8_status(self.accelerator, model_args)
@@ -112,9 +114,113 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         return super()._get_train_sampler(*args, **kwargs)
 
+    def _get_iqa_tokenizer(self):
+        tokenizer = getattr(self, "processing_class", None)
+        if tokenizer is None:
+            tokenizer = getattr(self, "tokenizer", None)
+
+        if tokenizer is None:
+            raise RuntimeError("Tokenizer is required to compute IQA losses but was not initialized.")
+
+        return tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
+
+    def _maybe_init_iqa_loss(self) -> None:
+        if self._iqa_score_loss is not None:
+            return
+
+        try:
+            from custom.loss_iqa_no_anchor import IQAScoreLoss
+        except ImportError as err:
+            raise ImportError(
+                "Cannot import IQAScoreLoss from `custom.loss_iqa_no_anchor`. "
+                "Ensure `src/custom/` is on PYTHONPATH and files are present."
+            ) from err
+
+        tokenizer = self._get_iqa_tokenizer()
+        self._iqa_score_loss = IQAScoreLoss(
+            tokenizer,
+            step=self.finetuning_args.iqa_loss_step,
+            sigma=self.finetuning_args.iqa_loss_sigma,
+            delta=self.finetuning_args.iqa_loss_delta,
+        )
+
+    def _compute_iqa_losses(
+        self, logits: torch.Tensor, input_ids: torch.Tensor, mos: torch.Tensor
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if logits.numel() == 0:
+            return None
+
+        self._maybe_init_iqa_loss()
+
+        try:
+            from custom.anspos_no_anchor import find_ans_pos_via_prefix
+        except ImportError as err:
+            raise ImportError(
+                "Cannot import `find_ans_pos_via_prefix` from `custom.anspos_no_anchor`. "
+                "Ensure custom modules are available."
+            ) from err
+
+        tokenizer = self._get_iqa_tokenizer()
+        input_texts = tokenizer.batch_decode(input_ids.detach().cpu().tolist(), skip_special_tokens=False)
+
+        ans_positions: list[int] = []
+        valid_indices: list[int] = []
+        for idx, text in enumerate(input_texts):
+            try:
+                ans_pos, _ = find_ans_pos_via_prefix(text, tokenizer)
+            except ValueError:
+                continue
+
+            ans_positions.append(ans_pos)
+            valid_indices.append(idx)
+
+        if len(valid_indices) == 0:
+            return None
+
+        device = logits.device
+        ans_pos_tensor = torch.tensor(ans_positions, dtype=torch.long, device=device)
+        logits_subset = logits[valid_indices]
+        mos_subset = mos[valid_indices]
+
+        loss_kl, loss_reg, s_hat = self._iqa_score_loss.extra_losses(logits_subset, ans_pos_tensor, mos_subset)
+        return loss_kl, loss_reg, s_hat
+
     @override
-    def compute_loss(self, model, inputs, *args, **kwargs):
-        return super().compute_loss(model, inputs, *args, **kwargs)
+    def compute_loss(
+        self, model, inputs, return_outputs: bool = False, *args, **kwargs
+    ):  # type: ignore[override]
+        forward_inputs = {k: v for k, v in inputs.items() if k not in {"mos", "gt_score"}}
+        loss, outputs = super().compute_loss(model, forward_inputs, return_outputs=True, *args, **kwargs)
+        total_loss = loss
+
+        if getattr(self.finetuning_args, "use_iqa_no_anchor_loss", False):
+            mos_tensor = inputs.get("mos") or inputs.get("gt_score")
+            logits = getattr(outputs, "logits", None)
+            if mos_tensor is not None and logits is not None:
+                mos_tensor = mos_tensor.to(logits.device).float()
+                iqa_losses = self._compute_iqa_losses(logits, inputs["input_ids"], mos_tensor)
+                if iqa_losses is not None:
+                    loss_kl, loss_reg, s_hat = iqa_losses
+                    total_loss = loss + (
+                        self.finetuning_args.iqa_loss_kl_weight * loss_kl
+                        + self.finetuning_args.iqa_loss_reg_weight * loss_reg
+                    )
+                    if hasattr(outputs, "loss"):
+                        outputs.loss = total_loss
+
+                    try:
+                        self.log(
+                            {
+                                "loss_ce": float(loss.detach().cpu()),
+                                "loss_kl": float(loss_kl.detach().cpu()),
+                                "loss_reg": float(loss_reg.detach().cpu()),
+                                "s_hat_mean": float(s_hat.detach().mean().cpu()),
+                            }
+                        )
+                    except Exception:
+                        pass
+
+        return (total_loss, outputs) if return_outputs else total_loss
 
     @override
     def prediction_step(

@@ -112,6 +112,22 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             model_inputs["videos"].append(examples["_videos"][i])
             model_inputs["audios"].append(examples["_audios"][i])
 
+            score = None
+            if "mos" in examples and examples["mos"][i] is not None:
+                score = examples["mos"][i]
+            elif "gt_score" in examples and examples["gt_score"][i] is not None:
+                score = examples["gt_score"][i]
+
+            if score is not None:
+                try:
+                    model_inputs["mos"].append(float(score))
+                except (TypeError, ValueError):
+                    logger.warning_rank0_once(f"Cannot cast MOS value {score} to float. Skipping this example.")
+                    # keep dataset aligned by dropping this example
+                    for key in ["input_ids", "attention_mask", "labels", "images", "videos", "audios"]:
+                        model_inputs[key].pop()
+                    continue
+
         return model_inputs
 
     def print_data_example(self, example: dict[str, list[int]]) -> None:

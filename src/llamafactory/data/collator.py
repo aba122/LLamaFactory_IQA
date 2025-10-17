@@ -108,7 +108,24 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios = [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
+        score_key = None
+        batch_scores: list[float] | None = None
+        if len(features) != 0:
+            if "mos" in features[0]:
+                score_key = "mos"
+            elif "gt_score" in features[0]:
+                score_key = "gt_score"
+
+        if score_key is not None:
+            batch_scores = []
+
         for feature in features:
+            if score_key is not None:
+                value = feature.pop(score_key, None)
+                if value is None:
+                    raise ValueError(f"Missing `{score_key}` in feature required for IQA loss.")
+                batch_scores.append(float(value))
+
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
@@ -232,6 +249,9 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             mm_inputs["cross_attention_mask"] = F.pad(cross_attention_mask, (0, 0, 0, 0, 0, seq_len - orig_len))
 
         features.update(mm_inputs)
+
+        if batch_scores is not None:
+            features["mos"] = torch.tensor(batch_scores, dtype=torch.float32)
 
         if "image_bound" in features:  # for minicpmv inputs
             bsz, seq_length = features["input_ids"].shape

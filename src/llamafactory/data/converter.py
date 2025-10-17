@@ -75,6 +75,16 @@ class DatasetConverter:
 
         return medias
 
+    def _append_scores(self, example: dict[str, Any], output: dict[str, Any]) -> None:
+        r"""Attach scalar quality scores if they exist."""
+        score_key = self.dataset_attr.score
+        if score_key and score_key in example:
+            output["mos"] = example[score_key]
+
+        gt_score_key = self.dataset_attr.gt_score
+        if gt_score_key and gt_score_key in example:
+            output["gt_score"] = example[gt_score_key]
+
     @abstractmethod
     def __call__(self, example: dict[str, Any]) -> dict[str, Any]:
         r"""Convert a single example in the dataset to the standard format."""
@@ -128,6 +138,7 @@ class AlpacaDatasetConverter(DatasetConverter):
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
         }
+        self._append_scores(example, output)
         return output
 
 
@@ -224,6 +235,7 @@ class SharegptDatasetConverter(DatasetConverter):
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
         }
+        self._append_scores(example, output)
         return output
 
 
@@ -364,6 +376,7 @@ class OpenAIDatasetConverter(DatasetConverter):
             "_videos": self._find_medias(example[self.dataset_attr.videos]) if self.dataset_attr.videos else None,
             "_audios": self._find_medias(example[self.dataset_attr.audios]) if self.dataset_attr.audios else None,
         }
+        self._append_scores(example, output)
         return output
 
 
