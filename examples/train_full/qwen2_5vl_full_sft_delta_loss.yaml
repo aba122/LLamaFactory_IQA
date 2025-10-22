@@ -12,12 +12,15 @@ freeze_vision_tower: true
 freeze_multi_modal_projector: true
 freeze_language_model: false
 deepspeed: examples/deepspeed/ds_z3_config.json
-use_iqa_no_anchor_loss: true
-iqa_loss_step: 0.05  # switch to 0.01 in later epochs if needed
-iqa_loss_sigma: 0.15
-iqa_loss_delta: 0.1
-iqa_loss_kl_weight: 0.7
-iqa_loss_reg_weight: 0.3
+
+# Delta Regression Loss
+enable_delta_loss: true
+delta_weight: 0.5
+delta_pairs_per_batch: 32
+delta_huber_delta: 0.1
+delta_near_ratio: 0.8
+delta_near_threshold: 0.3
+score_grid_step: 0.05
 
 ### dataset
 dataset: Q-insight_CoT_GPT4_v3_Reflection_SFT
@@ -27,8 +30,9 @@ overwrite_cache: true
 preprocessing_num_workers: 16
 dataloader_num_workers: 4
 
+
 ### output
-output_dir: saves/qwen2_5vl-7b/full/sft_new_loss
+output_dir: saves/qwen2_5vl-7b/full/sft_delta_regression
 logging_steps: 10
 save_steps: 600
 plot_loss: true
@@ -52,9 +56,3 @@ load_best_model_at_end: true
 metric_for_best_model: eval_loss
 early_stopping_steps: 400
 save_total_limit: 2
-
-### eval
-val_size: 0.05
-per_device_eval_batch_size: 1
-eval_strategy: steps
-eval_steps: 200

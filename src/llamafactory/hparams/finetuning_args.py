@@ -165,6 +165,39 @@ class OFTArguments:
 
 
 @dataclass
+@dataclass
+class DeltaLossArguments:
+    enable_delta_loss: bool = field(
+        default=False,
+        metadata={"help": "Enable the delta regression auxiliary loss on answer score differences."},
+    )
+    delta_weight: float = field(
+        default=0.5,
+        metadata={"help": "Weight applied to the delta regression loss."},
+    )
+    delta_pairs_per_batch: int = field(
+        default=32,
+        metadata={"help": "Number of sample pairs drawn per batch for the delta regression loss."},
+    )
+    delta_huber_delta: float = field(
+        default=0.1,
+        metadata={"help": "Huber delta value used in the delta regression loss."},
+    )
+    delta_near_ratio: float = field(
+        default=0.8,
+        metadata={"help": "Proportion of near pairs (by |Δy|) sampled for delta regression."},
+    )
+    delta_near_threshold: float = field(
+        default=0.3,
+        metadata={"help": "Threshold on |Δy| to treat a pair as near for delta regression sampling."},
+    )
+    score_grid_step: float = field(
+        default=0.05,
+        metadata={"help": "Step size when enumerating candidate scores in <answer> for delta regression."},
+    )
+
+
+@dataclass
 class RLHFArguments:
     r"""Arguments pertaining to the PPO, DPO and KTO training."""
 
@@ -446,6 +479,7 @@ class FinetuningArguments(
     BAdamArgument,
     ApolloArguments,
     GaloreArguments,
+    DeltaLossArguments,
     RLHFArguments,
     LoraArguments,
     OFTArguments,
@@ -594,6 +628,18 @@ class FinetuningArguments(
 
             if self.pissa_init:
                 raise ValueError("`pissa_init` is only valid for LoRA training.")
+
+        if self.score_grid_step <= 0:
+            raise ValueError("`score_grid_step` must be positive.")
+
+        if not (0.0 <= self.delta_near_ratio <= 1.0):
+            raise ValueError("`delta_near_ratio` must be within [0, 1].")
+
+        if self.delta_pairs_per_batch < 0:
+            raise ValueError("`delta_pairs_per_batch` must be non-negative.")
+
+        if self.delta_huber_delta <= 0:
+            raise ValueError("`delta_huber_delta` must be positive.")
 
     def to_dict(self) -> dict[str, Any]:
         args = asdict(self)

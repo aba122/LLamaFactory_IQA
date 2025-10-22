@@ -27,6 +27,11 @@ from transformers import DataCollatorForSeq2Seq
 from ..extras.constants import AUDIO_PLACEHOLDER, IGNORE_INDEX, IMAGE_PLACEHOLDER
 from ..extras.packages import is_pillow_available
 
+try:
+    from custom.utils_iqa import find_answer_start_position
+except ImportError:
+    find_answer_start_position = None
+
 
 if is_pillow_available():
     from PIL import Image
@@ -119,6 +124,9 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         if score_key is not None:
             batch_scores = []
 
+        ans_positions: list[int] = []
+        ans_valid_mask: list[bool] = []
+
         for feature in features:
             if score_key is not None:
                 value = feature.pop(score_key, None)
@@ -136,6 +144,18 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             batch_vidlens.append(len(videos))
             batch_audlens.append(len(audios))
             batch_input_ids.append(feature["input_ids"])
+
+            raw_input_ids = feature["input_ids"]
+            if find_answer_start_position is not None:
+                rendered = self.tokenizer.decode(
+                    raw_input_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+                )
+                ans_pos = find_answer_start_position(rendered, self.tokenizer)
+            else:
+                ans_pos = -1
+
+            ans_positions.append(ans_pos)
+            ans_valid_mask.append(ans_pos >= 0)
 
         fake_input_ids = []
         if (
@@ -250,8 +270,17 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
         features.update(mm_inputs)
 
+        batch_size = features["input_ids"].size(0)
         if batch_scores is not None:
-            features["mos"] = torch.tensor(batch_scores, dtype=torch.float32)
+            score_tensor = torch.tensor(batch_scores, dtype=torch.float32)
+            features["mos"] = score_tensor
+            features["gt_scores"] = score_tensor
+        else:
+            nan_scores = torch.full((batch_size,), float("nan"), dtype=torch.float32)
+            features["gt_scores"] = nan_scores
+
+        features["ans_pos"] = torch.tensor(ans_positions, dtype=torch.long)
+        features["ans_valid"] = torch.tensor(ans_valid_mask, dtype=torch.bool)
 
         if "image_bound" in features:  # for minicpmv inputs
             bsz, seq_length = features["input_ids"].shape

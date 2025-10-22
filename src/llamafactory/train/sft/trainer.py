@@ -32,6 +32,19 @@ from ..callbacks import SaveProcessorCallback
 from ..fp8_utils import configure_fp8_environment, verify_fp8_status
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
 
+try:
+    from custom.utils_iqa import (
+        build_score_candidates as delta_build_score_candidates,
+        huber_loss as delta_huber_loss,
+        sample_delta_pairs as delta_sample_delta_pairs,
+        seq_logprob_at as delta_seq_logprob_at,
+    )
+except ImportError:
+    delta_build_score_candidates = None
+    delta_huber_loss = None
+    delta_sample_delta_pairs = None
+    delta_seq_logprob_at = None
+
 
 if TYPE_CHECKING:
     from torch.utils.data import Dataset
@@ -89,6 +102,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             self.compute_loss_func = dft_loss_func
 
         self._iqa_score_loss = None
+        self._delta_grid_vals_cpu = None
+        self._delta_cand_ids_cpu = None
+        self._delta_cand_mask_cpu = None
 
         # Verify FP8 status after trainer initialization (accelerator should be available)
         if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
@@ -144,6 +160,56 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             delta=self.finetuning_args.iqa_loss_delta,
         )
 
+    def _maybe_init_delta_cache(self) -> None:
+        if not getattr(self.finetuning_args, "enable_delta_loss", False):
+            return
+
+        if self._delta_grid_vals_cpu is not None:
+            return
+
+        if delta_build_score_candidates is None:
+            raise ImportError(
+                "Cannot import delta regression helpers from `custom.utils_iqa`. "
+                "Ensure the custom module is available."
+            )
+
+        tokenizer = self._get_iqa_tokenizer()
+        (
+            self._delta_grid_vals_cpu,
+            self._delta_cand_ids_cpu,
+            self._delta_cand_mask_cpu,
+        ) = delta_build_score_candidates(tokenizer, self.finetuning_args.score_grid_step)
+
+    def _scores_from_logits_delta(self, logits: torch.Tensor, ans_pos: torch.Tensor) -> torch.Tensor:
+        self._maybe_init_delta_cache()
+        if self._delta_grid_vals_cpu is None:
+            return torch.full((logits.size(0),), float("nan"), device=logits.device)
+
+        if delta_seq_logprob_at is None:
+            raise ImportError(
+                "Cannot import `seq_logprob_at` from custom utils. Ensure custom modules are accessible."
+            )
+
+        device = logits.device
+        cand_ids = self._delta_cand_ids_cpu.to(device)
+        cand_mask = self._delta_cand_mask_cpu.to(device)
+        grid_vals = self._delta_grid_vals_cpu.to(device)
+
+        scores = []
+        for b in range(logits.size(0)):
+            pos = int(ans_pos[b].item())
+            if pos < 0:
+                scores.append(torch.tensor(float("nan"), device=device))
+                continue
+
+            logp = delta_seq_logprob_at(logits[b], pos, cand_ids, cand_mask)
+            probs = torch.softmax(logp, dim=0)
+            probs = probs.clamp_min(1e-12)
+            probs = probs / probs.sum()
+            scores.append(torch.sum(probs * grid_vals))
+
+        return torch.stack(scores, dim=0)
+
     def _compute_iqa_losses(
         self, logits: torch.Tensor, input_ids: torch.Tensor, mos: torch.Tensor
     ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -189,36 +255,87 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     def compute_loss(
         self, model, inputs, return_outputs: bool = False, *args, **kwargs
     ):  # type: ignore[override]
-        forward_inputs = {k: v for k, v in inputs.items() if k not in {"mos", "gt_score"}}
+        forward_inputs = {
+            k: v
+            for k, v in inputs.items()
+            if k not in {"mos", "gt_score", "gt_scores", "ans_pos", "ans_valid"}
+        }
         loss, outputs = super().compute_loss(model, forward_inputs, return_outputs=True, *args, **kwargs)
         total_loss = loss
+        log_values = {"loss_ce": float(loss.detach().cpu())}
+        logits = getattr(outputs, "logits", None)
 
-        if getattr(self.finetuning_args, "use_iqa_no_anchor_loss", False):
+        if getattr(self.finetuning_args, "use_iqa_no_anchor_loss", False) and logits is not None:
             mos_tensor = inputs.get("mos") or inputs.get("gt_score")
-            logits = getattr(outputs, "logits", None)
-            if mos_tensor is not None and logits is not None:
+            if mos_tensor is not None:
                 mos_tensor = mos_tensor.to(logits.device).float()
                 iqa_losses = self._compute_iqa_losses(logits, inputs["input_ids"], mos_tensor)
                 if iqa_losses is not None:
                     loss_kl, loss_reg, s_hat = iqa_losses
-                    total_loss = loss + (
+                    total_loss = total_loss + (
                         self.finetuning_args.iqa_loss_kl_weight * loss_kl
                         + self.finetuning_args.iqa_loss_reg_weight * loss_reg
                     )
-                    if hasattr(outputs, "loss"):
-                        outputs.loss = total_loss
+                    log_values.update(
+                        {
+                            "loss_kl": float(loss_kl.detach().cpu()),
+                            "loss_reg": float(loss_reg.detach().cpu()),
+                            "s_hat_mean": float(s_hat.detach().mean().cpu()),
+                        }
+                    )
 
-                    try:
-                        self.log(
-                            {
-                                "loss_ce": float(loss.detach().cpu()),
-                                "loss_kl": float(loss_kl.detach().cpu()),
-                                "loss_reg": float(loss_reg.detach().cpu()),
-                                "s_hat_mean": float(s_hat.detach().mean().cpu()),
-                            }
-                        )
-                    except Exception:
-                        pass
+        loss_delta = None
+        if getattr(self.finetuning_args, "enable_delta_loss", False) and logits is not None:
+            if (
+                delta_build_score_candidates is None
+                or delta_huber_loss is None
+                or delta_sample_delta_pairs is None
+                or delta_seq_logprob_at is None
+            ):
+                raise ImportError(
+                    "Delta regression loss requested but `custom.utils_iqa` helpers are unavailable. "
+                    "Ensure the custom module is importable."
+                )
+
+            gt_scores_tensor = inputs.get("gt_scores")
+            ans_pos_tensor = inputs.get("ans_pos")
+            ans_valid_tensor = inputs.get("ans_valid")
+            if (
+                gt_scores_tensor is not None
+                and ans_pos_tensor is not None
+                and ans_valid_tensor is not None
+            ):
+                gt_scores_tensor = gt_scores_tensor.to(logits.device).float()
+                ans_pos_tensor = ans_pos_tensor.to(logits.device)
+                ans_valid_tensor = ans_valid_tensor.to(logits.device)
+                valid_mask = ans_valid_tensor & torch.isfinite(gt_scores_tensor)
+
+                if valid_mask.sum() >= 2:
+                    scores_hat = self._scores_from_logits_delta(logits, ans_pos_tensor)
+                    i_idx, j_idx = delta_sample_delta_pairs(
+                        gt_scores_tensor,
+                        valid_mask,
+                        self.finetuning_args.delta_pairs_per_batch,
+                        self.finetuning_args.delta_near_ratio,
+                        self.finetuning_args.delta_near_threshold,
+                    )
+                    if i_idx.numel() > 0:
+                        d_hat = torch.abs(scores_hat[i_idx] - scores_hat[j_idx])
+                        d_gt = torch.abs(gt_scores_tensor[i_idx] - gt_scores_tensor[j_idx])
+                        err = d_hat - d_gt
+                        loss_delta = delta_huber_loss(err, self.finetuning_args.delta_huber_delta).mean()
+                        total_loss = total_loss + self.finetuning_args.delta_weight * loss_delta
+                        log_values["loss_delta"] = float(loss_delta.detach().cpu())
+        if getattr(self.finetuning_args, "enable_delta_loss", False) and "loss_delta" not in log_values:
+            log_values["loss_delta"] = 0.0
+
+        if getattr(outputs, "loss", None) is not None:
+            outputs.loss = total_loss
+
+        try:
+            self.log(log_values)
+        except Exception:
+            pass
 
         return (total_loss, outputs) if return_outputs else total_loss
 
